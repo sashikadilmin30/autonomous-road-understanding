@@ -396,21 +396,51 @@ def process_frame(frame):
         maxLineGap=50,
     )
 
+    # classify raw Hough lines into left / right groups
     left_lines, right_lines = classify_lane_lines(image, lines)
-    left_avg = average_line(left_lines)
-    right_avg = average_line(right_lines)
+
+    # sample dense points from the raw segments and fit 2nd-order polynomials
     left_sample_points = sample_points_from_lines(left_lines)
     right_sample_points = sample_points_from_lines(right_lines)
+
     left_curve = fit_lane_curve(left_sample_points)
     right_curve = fit_lane_curve(right_sample_points)
+
     left_curve_points = generate_curve_points(image, left_curve)
     right_curve_points = generate_curve_points(image, right_curve)
-    left_points = line_points_from_params(image, left_avg)
-    right_points = line_points_from_params(image, right_avg)
 
-    if left_curve_points is not None:
+    # If both curves exist, ensure they do not cross. If they cross, trim
+    # the top portion up to the first crossing so the left x < right x holds.
+    if left_curve_points is not None and right_curve_points is not None:
+        # Both lists are ordered top->bottom
+        min_len = min(len(left_curve_points), len(right_curve_points))
+        crossed_index = None
+        for i in range(min_len):
+            lx, ly = left_curve_points[i]
+            rx, ry = right_curve_points[i]
+            if lx >= rx:
+                crossed_index = i
+                break
+
+        if crossed_index is not None:
+            # Trim everything up to and including the crossing index
+            new_left = left_curve_points[crossed_index + 1 :]
+            new_right = right_curve_points[crossed_index + 1 :]
+
+            # If trimming removed too many points, discard curves to avoid bad geometry
+            if len(new_left) >= 2 and len(new_right) >= 2:
+                left_curve_points = new_left
+                right_curve_points = new_right
+            else:
+                left_curve_points = None
+                right_curve_points = None
+
+    # Derive boundary anchor points (bottom, top) from curves when available
+    left_points = None
+    right_points = None
+    if left_curve_points is not None and len(left_curve_points) >= 2:
         left_points = (left_curve_points[-1], left_curve_points[0])
-    if right_curve_points is not None:
+    if right_curve_points is not None and len(right_curve_points) >= 2:
         right_points = (right_curve_points[-1], right_curve_points[0])
 
     line_image = np.zeros_like(image)
@@ -421,15 +451,12 @@ def process_frame(frame):
             x1, y1, x2, y2 = line[0]
             cv2.line(debug, (x1, y1), (x2, y2), (0, 255, 255), 2)
 
+    # Draw smooth polynomial boundaries when available
     if left_curve_points is not None:
         cv2.polylines(line_image, [np.array(left_curve_points, dtype=np.int32)], False, (255, 0, 0), 6)
-    else:
-        draw_full_line(line_image, left_avg, (255, 0, 0))
 
     if right_curve_points is not None:
         cv2.polylines(line_image, [np.array(right_curve_points, dtype=np.int32)], False, (0, 255, 0), 6)
-    else:
-        draw_full_line(line_image, right_avg, (0, 255, 0))
 
     lane_overlay, _ = fill_lane_area(
         image,
