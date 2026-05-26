@@ -1,5 +1,6 @@
 import cv2
 import numpy as np
+from collections import deque
 
 
 LANE_TOP_RATIO = 0.52
@@ -16,6 +17,11 @@ COLOR_ERROR = (0, 80, 255)
 COLOR_PANEL = (20, 20, 20)
 COLOR_LANE_FILL = (0, 200, 90)
 COLOR_SECTION = (180, 180, 180)
+SMOOTHING_WINDOW = 5  # number of frames for temporal moving average
+
+# Temporal buffers for polynomial coefficients (store arrays [a,b,c])
+left_curve_buffer = deque(maxlen=SMOOTHING_WINDOW)
+right_curve_buffer = deque(maxlen=SMOOTHING_WINDOW)
 
 
 def region_of_interest(edges):
@@ -403,9 +409,25 @@ def process_frame(frame):
     left_sample_points = sample_points_from_lines(left_lines)
     right_sample_points = sample_points_from_lines(right_lines)
 
-    left_curve = fit_lane_curve(left_sample_points)
-    right_curve = fit_lane_curve(right_sample_points)
+    # Fit raw polynomials from current frame
+    left_curve_raw = fit_lane_curve(left_sample_points)
+    right_curve_raw = fit_lane_curve(right_sample_points)
 
+    # Update temporal buffers with raw detections when available
+    if left_curve_raw is not None:
+        left_curve_buffer.append(np.array(left_curve_raw, dtype=np.float32))
+    if right_curve_raw is not None:
+        right_curve_buffer.append(np.array(right_curve_raw, dtype=np.float32))
+
+    # Compute smoothed coefficients (moving average) — handle missing detections gracefully
+    left_curve = None
+    right_curve = None
+    if len(left_curve_buffer) > 0:
+        left_curve = np.mean(np.vstack(list(left_curve_buffer)), axis=0)
+    if len(right_curve_buffer) > 0:
+        right_curve = np.mean(np.vstack(list(right_curve_buffer)), axis=0)
+
+    # Generate curve points from smoothed coefficients
     left_curve_points = generate_curve_points(image, left_curve)
     right_curve_points = generate_curve_points(image, right_curve)
 
