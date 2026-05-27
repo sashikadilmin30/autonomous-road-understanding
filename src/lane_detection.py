@@ -1,27 +1,24 @@
 import cv2
 import numpy as np
 from collections import deque
+from pathlib import Path
 
-
-LANE_TOP_RATIO = 0.52
-CURVE_SAMPLE_COUNT = 25
 VIDEO_PATH = "data/road.mp4"
 OUTPUT_VIDEO_PATH = "results/lane_output.mp4"
-PLAYBACK_SLOWDOWN = 2.0
-DISPLAY_FPS = None
-PROCESS_EVERY_NTH_FRAME = 3
-COLOR_LABEL = (255, 255, 255)
-COLOR_GOOD = (0, 220, 80)
-COLOR_WARN = (0, 220, 255)
-COLOR_ERROR = (0, 80, 255)
-COLOR_PANEL = (20, 20, 20)
-COLOR_LANE_FILL = (0, 200, 90)
-COLOR_SECTION = (180, 180, 180)
-SMOOTHING_WINDOW = 5  # number of frames for temporal moving average
+CENTER_REJECTION_RATIO = 0.15
+LEFT_BOUNDARY_MAX_RATIO = 0.35
+RIGHT_BOUNDARY_MIN_RATIO = 0.65
+LANE_TOP_RATIO = 0.55
+SMOOTHING_WINDOW = 5
+THUMBNAIL_COUNT = 5
+THUMBNAIL_STRIP_HEIGHT = 100
+BOUNDARY_BOTTOM_OUTWARD_SHIFT = 20
+BOUNDARY_TOP_OUTWARD_SHIFT = 70
+FILL_BOTTOM_INSET_RATIO = 0.16
+FILL_TOP_INSET_RATIO = 0.08
 
-# Temporal buffers for polynomial coefficients (store arrays [a,b,c])
-left_curve_buffer = deque(maxlen=SMOOTHING_WINDOW)
-right_curve_buffer = deque(maxlen=SMOOTHING_WINDOW)
+boundary_pair_history = deque(maxlen=SMOOTHING_WINDOW)
+thumbnail_history = deque(maxlen=THUMBNAIL_COUNT)
 
 
 def region_of_interest(edges):
@@ -30,10 +27,10 @@ def region_of_interest(edges):
 
     polygon = np.array(
         [[
-            (int(width * 0.18), height),
-            (int(width * 0.82), height),
-            (int(width * 0.59), int(height * 0.52)),
-            (int(width * 0.41), int(height * 0.52)),
+            (0, height),
+            (width, height),
+            (int(width * 0.85), int(height * LANE_TOP_RATIO)),
+            (int(width * 0.15), int(height * LANE_TOP_RATIO)),
         ]],
         dtype=np.int32,
     )
@@ -42,8 +39,61 @@ def region_of_interest(edges):
     return cv2.bitwise_and(edges, mask)
 
 
-def average_line(lines):
-    if not lines:
+def filter_boundary_lines(lines, width):
+    left_lines = []
+    right_lines = []
+
+    if lines is None:
+        return left_lines, right_lines
+
+    image_center = width // 2
+    center_rejection_width = width * CENTER_REJECTION_RATIO
+    left_boundary_max_x = width * LEFT_BOUNDARY_MAX_RATIO
+    right_boundary_min_x = width * RIGHT_BOUNDARY_MIN_RATIO
+
+    for line in lines:
+        x1, y1, x2, y2 = line[0]
+        if x2 == x1:
+            continue
+
+        slope = (y2 - y1) / (x2 - x1)
+        mid_x = (x1 + x2) / 2
+        bottom_x = x1 if y1 > y2 else x2
+
+        if abs(mid_x - image_center) < center_rejection_width:
+            continue
+
+        if bottom_x < left_boundary_max_x and mid_x < image_center and slope < 0:
+            left_lines.append((x1, y1, x2, y2))
+        elif bottom_x > right_boundary_min_x and mid_x > image_center and slope > 0:
+            right_lines.append((x1, y1, x2, y2))
+
+    return left_lines, right_lines
+
+
+def white_edge_mask(image, edges):
+    white_mask = cv2.inRange(image, np.array([170, 170, 170]), np.array([255, 255, 255]))
+    white_mask = cv2.GaussianBlur(white_mask, (5, 5), 0)
+    white_mask = cv2.dilate(white_mask, np.ones((5, 5), dtype=np.uint8), iterations=1)
+    return cv2.bitwise_and(edges, white_mask)
+
+
+def score_line_on_white_edges(line, white_edges):
+    x1, y1, x2, y2 = line
+    length = np.hypot(x2 - x1, y2 - y1)
+    samples = max(10, int(length))
+    xs = np.linspace(x1, x2, samples).astype(np.int32)
+    ys = np.linspace(y1, y2, samples).astype(np.int32)
+
+    xs = np.clip(xs, 0, white_edges.shape[1] - 1)
+    ys = np.clip(ys, 0, white_edges.shape[0] - 1)
+
+    white_hits = np.count_nonzero(white_edges[ys, xs])
+    return max(1.0, length + white_hits * 4.0)
+
+
+def average_boundary_line(lines, height, white_edges):
+    if len(lines) == 0:
         return None
 
     slopes = []
@@ -51,450 +101,252 @@ def average_line(lines):
     weights = []
 
     for x1, y1, x2, y2 in lines:
+        if x2 == x1:
+            continue
         slope = (y2 - y1) / (x2 - x1)
         intercept = y1 - slope * x1
-        length = np.hypot(x2 - x1, y2 - y1)
-
         slopes.append(slope)
         intercepts.append(intercept)
-        weights.append(length)
+        weights.append(score_line_on_white_edges((x1, y1, x2, y2), white_edges))
 
-    return np.average(slopes, weights=weights), np.average(intercepts, weights=weights)
+    if len(slopes) == 0:
+        return None
 
+    slope = np.average(slopes, weights=weights)
+    intercept = np.average(intercepts, weights=weights)
 
-def classify_lane_lines(image, lines):
-    left_lines = []
-    right_lines = []
-
-    _, width, _ = image.shape
-    center_x = width / 2
-    center_margin = width * 0.05
-
-    if lines is None:
-        return left_lines, right_lines
-
-    for line in lines:
-        x1, y1, x2, y2 = line[0]
-
-        if x1 == x2:
-            continue
-
-        slope = (y2 - y1) / (x2 - x1)
-        length = np.hypot(x2 - x1, y2 - y1)
-        midpoint_x = (x1 + x2) / 2
-
-        if length < 20:
-            continue
-
-        if abs(slope) < 0.15 or abs(slope) > 1.5:
-            continue
-
-        if abs(midpoint_x - center_x) < center_margin:
-            continue
-
-        if slope < 0 and midpoint_x < center_x:
-            left_lines.append((x1, y1, x2, y2))
-        elif slope > 0 and midpoint_x > center_x:
-            right_lines.append((x1, y1, x2, y2))
-
-    return left_lines, right_lines
-
-
-def draw_full_line(image, line_params, color):
-    if line_params is None:
-        return
-
-    slope, intercept = line_params
-    y1 = image.shape[0]
-    y2 = int(y1 * LANE_TOP_RATIO)
+    y1 = height
+    y2 = int(height * LANE_TOP_RATIO)
 
     x1 = int((y1 - intercept) / slope)
     x2 = int((y2 - intercept) / slope)
 
-    x1 = max(0, min(image.shape[1] - 1, x1))
-    x2 = max(0, min(image.shape[1] - 1, x2))
-
-    cv2.line(image, (x1, y1), (x2, y2), color, 6)
+    return x1, y1, x2, y2
 
 
-def sample_points_from_lines(lines, samples_per_line=CURVE_SAMPLE_COUNT):
-    points = []
+def validate_boundaries(left_boundary, right_boundary):
+    if left_boundary is None or right_boundary is None:
+        return None, None
 
-    for x1, y1, x2, y2 in lines:
-        xs = np.linspace(x1, x2, samples_per_line)
-        ys = np.linspace(y1, y2, samples_per_line)
+    left_x_bottom = left_boundary[0]
+    right_x_bottom = right_boundary[0]
+    left_x_top = left_boundary[2]
+    right_x_top = right_boundary[2]
 
-        for x, y in zip(xs, ys):
-            points.append((float(x), float(y)))
+    if left_x_bottom >= right_x_bottom or left_x_top >= right_x_top:
+        return None, None
 
-    return points
+    return left_boundary, right_boundary
 
 
-def fit_lane_curve(points):
-    if len(points) < 6:
+def constrain_boundary_to_outer_band(boundary, width, side):
+    if boundary is None:
         return None
 
-    y = np.array([point[1] for point in points], dtype=np.float32)
-    x = np.array([point[0] for point in points], dtype=np.float32)
-
-    if len(np.unique(y.astype(np.int32))) < 3:
-        return None
-
-    return np.polyfit(y, x, 2)
-
-
-def generate_curve_points(image, curve, num_points=60):
-    if curve is None:
-        return None
-
-    y_top = int(image.shape[0] * LANE_TOP_RATIO)
-    y_bottom = image.shape[0] - 1
-    y_values = np.linspace(y_top, y_bottom, num_points)
-    x_values = np.polyval(curve, y_values)
-
-    curve_points = []
-    for x, y in zip(x_values, y_values):
-        x = int(np.clip(x, 0, image.shape[1] - 1))
-        y = int(np.clip(y, 0, image.shape[0] - 1))
-        curve_points.append((x, y))
-
-    return curve_points
-
-
-def line_points_from_params(image, line_params):
-    if line_params is None:
-        return None
-
-    slope, intercept = line_params
-    if abs(slope) < 1e-6:
-        return None
-
-    y_bottom = image.shape[0] - 1
-    y_top = int(image.shape[0] * LANE_TOP_RATIO)
-
-    x_bottom = int((y_bottom - intercept) / slope)
-    x_top = int((y_top - intercept) / slope)
-
-    x_bottom = max(0, min(image.shape[1] - 1, x_bottom))
-    x_top = max(0, min(image.shape[1] - 1, x_top))
-
-    return (x_bottom, y_bottom), (x_top, y_top)
-
-
-def fill_lane_area(image, left_points, right_points, left_curve_points=None, right_curve_points=None):
-    if left_points is None or right_points is None:
-        return image.copy(), None
-
-    overlay = image.copy()
-    if left_curve_points is not None and right_curve_points is not None:
-        polygon_points = left_curve_points + list(reversed(right_curve_points))
+    x1, y1, x2, y2 = boundary
+    if side == "left":
+        max_x = int(width * LEFT_BOUNDARY_MAX_RATIO)
+        x1 = int(np.clip(x1, 0, max_x))
+        x2 = int(np.clip(x2, 0, max_x))
     else:
-        polygon_points = [
-            left_points[0],
-            left_points[1],
-            right_points[1],
-            right_points[0],
-        ]
+        min_x = int(width * RIGHT_BOUNDARY_MIN_RATIO)
+        x1 = int(np.clip(x1, min_x, width - 1))
+        x2 = int(np.clip(x2, min_x, width - 1))
 
-    lane_polygon = np.array([polygon_points], dtype=np.int32)
-
-    cv2.fillPoly(overlay, lane_polygon, COLOR_LANE_FILL)
-    filled = cv2.addWeighted(overlay, 0.18, image, 0.82, 0)
-    return filled, lane_polygon
+    return x1, y1, x2, y2
 
 
-def calculate_lane_metrics(image, left_points, right_points):
-    if left_points is None or right_points is None:
-        return None
+def smooth_boundary_pair(left_boundary, right_boundary):
+    left_boundary, right_boundary = validate_boundaries(left_boundary, right_boundary)
+    if left_boundary is None or right_boundary is None:
+        return None, None
 
-    vehicle_center_x = image.shape[1] // 2
-    lane_center_x = int((left_points[0][0] + right_points[0][0]) / 2)
-    offset_px = vehicle_center_x - lane_center_x
-    lane_width_px = max(1, right_points[0][0] - left_points[0][0])
-    offset_percent = (offset_px / lane_width_px) * 100
-
-    if offset_px > 0:
-        direction = "right"
-    elif offset_px < 0:
-        direction = "left"
-    else:
-        direction = "center"
-
-    return {
-        "vehicle_center_x": vehicle_center_x,
-        "lane_center_x": lane_center_x,
-        "offset_px": offset_px,
-        "offset_percent": offset_percent,
-        "direction": direction,
-    }
-
-
-def calculate_curvature_radius(curve, y_eval):
-    if curve is None:
-        return None
-
-    a, b, _ = curve
-    denominator = abs(2 * a)
-    if denominator < 1e-6:
-        return float("inf")
-
-    return ((1 + (2 * a * y_eval + b) ** 2) ** 1.5) / denominator
-
-
-def estimate_lane_curvature(image, left_curve, right_curve, left_curve_points, right_curve_points):
-    if left_curve is None or right_curve is None:
-        return None
-
-    y_eval = image.shape[0] - 1
-    left_radius = calculate_curvature_radius(left_curve, y_eval)
-    right_radius = calculate_curvature_radius(right_curve, y_eval)
-
-    if left_radius is None or right_radius is None:
-        return None
-
-    lane_center_bottom = int((left_curve_points[-1][0] + right_curve_points[-1][0]) / 2)
-    lane_center_top = int((left_curve_points[0][0] + right_curve_points[0][0]) / 2)
-    center_shift = lane_center_top - lane_center_bottom
-    straight_threshold = image.shape[1] * 0.02
-
-    if abs(center_shift) < straight_threshold:
-        road_direction = "Straight"
-    elif center_shift > 0:
-        road_direction = "Right Curve"
-    else:
-        road_direction = "Left Curve"
-
-    finite_radii = [radius for radius in (left_radius, right_radius) if np.isfinite(radius)]
-    curvature_radius = float(np.mean(finite_radii)) if finite_radii else float("inf")
-
-    return {
-        "left_radius": left_radius,
-        "right_radius": right_radius,
-        "curvature_radius": curvature_radius,
-        "road_direction": road_direction,
-    }
-
-
-def get_status_color(level):
-    if level == "error":
-        return COLOR_ERROR
-    if level == "warning":
-        return COLOR_WARN
-    return COLOR_GOOD
-
-
-def draw_dashboard_row(image, label, value, y, level):
-    cv2.putText(image, label, (32, y), cv2.FONT_HERSHEY_SIMPLEX, 0.52, COLOR_LABEL, 1)
-    cv2.putText(image, value, (175, y), cv2.FONT_HERSHEY_SIMPLEX, 0.56, get_status_color(level), 2)
-
-
-def draw_dashboard_section(image, title, y):
-    cv2.putText(image, title, (32, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, COLOR_SECTION, 1)
-    cv2.line(image, (135, y - 5), (332, y - 5), (70, 70, 70), 1)
-
-
-def draw_info_panel(image, metrics, curvature):
-    panel = image.copy()
-    x1, y1 = 15, 15
-    x2, y2 = 365, 255
-    cv2.rectangle(panel, (x1, y1), (x2, y2), COLOR_PANEL, -1)
-    cv2.addWeighted(panel, 0.5, image, 0.5, 0, image)
-
-    cv2.putText(image, "Autonomous Road System", (30, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.72, COLOR_LABEL, 2)
-    cv2.putText(image, "Lane Guidance Dashboard", (31, 62), cv2.FONT_HERSHEY_SIMPLEX, 0.42, COLOR_SECTION, 1)
-
-    draw_dashboard_section(image, "Offset", 92)
-    if metrics is None:
-        draw_dashboard_row(image, "Lane Center", "Unavailable", 118, "error")
-        draw_dashboard_row(image, "Vehicle Offset", "No lane lock", 145, "error")
-    else:
-        offset_abs = abs(metrics["offset_px"])
-        offset_ratio = abs(metrics["offset_percent"])
-        if metrics["direction"] == "center":
-            offset_text = "Centered"
-        else:
-            offset_text = f"{offset_abs}px {metrics['direction']}"
-
-        if offset_ratio <= 5:
-            offset_level = "safe"
-        elif offset_ratio <= 12:
-            offset_level = "warning"
-        else:
-            offset_level = "error"
-
-        draw_dashboard_row(image, "Lane Center", f"{metrics['lane_center_x']} px", 118, "safe")
-        draw_dashboard_row(image, "Vehicle Offset", offset_text, 145, offset_level)
-
-    draw_dashboard_section(image, "Curvature", 177)
-    if curvature is None:
-        draw_dashboard_row(image, "Radius", "Unavailable", 203, "error")
-    else:
-        if np.isfinite(curvature["curvature_radius"]):
-            curvature_text = f"{curvature['curvature_radius']:.1f} px"
-        else:
-            curvature_text = "Very large"
-        draw_dashboard_row(image, "Radius", curvature_text, 203, "safe")
-
-    draw_dashboard_section(image, "Direction", 235)
-    if curvature is None:
-        draw_dashboard_row(image, "Road Shape", "Unknown", 251, "error")
-    else:
-        if curvature["road_direction"] == "Straight":
-            direction_level = "safe"
-        else:
-            direction_level = "warning"
-        draw_dashboard_row(image, "Road Shape", curvature["road_direction"], 251, direction_level)
-
-
-def get_display_delay_ms(source_fps):
-    target_fps = DISPLAY_FPS if DISPLAY_FPS is not None else source_fps / PLAYBACK_SLOWDOWN
-    if target_fps <= 0:
-        target_fps = 15.0
-
-    return max(1, int(1000 / target_fps))
-
-
-def draw_lane_guidance(image, left_points, right_points, metrics, curvature=None):
-    guided = image.copy()
-
-    if left_points is not None and right_points is not None:
-        lane_center_top = (
-            int((left_points[1][0] + right_points[1][0]) / 2),
-            left_points[1][1],
-        )
-        lane_center_bottom = (metrics["lane_center_x"], left_points[0][1])
-
-        cv2.line(guided, lane_center_top, lane_center_bottom, (255, 255, 255), 2)
-        cv2.circle(guided, lane_center_bottom, 7, (255, 255, 255), -1)
-
-    vehicle_center = (metrics["vehicle_center_x"], image.shape[0] - 1)
-    lane_center = (metrics["lane_center_x"], image.shape[0] - 1)
-
-    cv2.line(
-        guided,
-        (metrics["vehicle_center_x"], int(image.shape[0] * 0.62)),
-        vehicle_center,
-        (0, 0, 255),
-        2,
+    boundary_pair_history.append(
+        np.array([left_boundary, right_boundary], dtype=np.float32)
     )
-    cv2.circle(guided, vehicle_center, 7, (0, 0, 255), -1)
-    cv2.line(guided, vehicle_center, lane_center, (0, 255, 255), 2)
+    smoothed_pair = np.mean(np.stack(boundary_pair_history), axis=0).astype(np.int32)
 
-    draw_info_panel(guided, metrics, curvature)
+    return validate_boundaries(tuple(smoothed_pair[0]), tuple(smoothed_pair[1]))
 
-    return guided
+
+def draw_boundary(img, boundary, color):
+    if boundary is None:
+        return
+    x1, y1, x2, y2 = boundary
+    x1 = max(0, min(img.shape[1] - 1, x1))
+    x2 = max(0, min(img.shape[1] - 1, x2))
+
+    cv2.line(img, (x1, y1), (x2, y2), color, 8)
+
+
+def adjust_boundaries_for_display(left_boundary, right_boundary, width):
+    left_boundary, right_boundary = validate_boundaries(left_boundary, right_boundary)
+    if left_boundary is None or right_boundary is None:
+        return None, None
+
+    lx1, ly1, lx2, ly2 = left_boundary
+    rx1, ry1, rx2, ry2 = right_boundary
+
+    lx1 = int(np.clip(lx1 - BOUNDARY_BOTTOM_OUTWARD_SHIFT, 0, width - 1))
+    lx2 = int(np.clip(lx2 - BOUNDARY_TOP_OUTWARD_SHIFT, 0, width - 1))
+    rx1 = int(np.clip(rx1 + BOUNDARY_BOTTOM_OUTWARD_SHIFT, 0, width - 1))
+    rx2 = int(np.clip(rx2 + BOUNDARY_TOP_OUTWARD_SHIFT, 0, width - 1))
+
+    return validate_boundaries((lx1, ly1, lx2, ly2), (rx1, ry1, rx2, ry2))
+
+
+def inset_lane_fill(left_boundary, right_boundary):
+    lx1, ly1, lx2, ly2 = left_boundary
+    rx1, ry1, rx2, ry2 = right_boundary
+
+    bottom_width = rx1 - lx1
+    top_width = rx2 - lx2
+
+    fill_lx1 = int(lx1 + bottom_width * FILL_BOTTOM_INSET_RATIO)
+    fill_rx1 = int(rx1 - bottom_width * FILL_BOTTOM_INSET_RATIO)
+    fill_lx2 = int(lx2 + top_width * FILL_TOP_INSET_RATIO)
+    fill_rx2 = int(rx2 - top_width * FILL_TOP_INSET_RATIO)
+
+    return [(fill_lx1, ly1), (fill_lx2, ly2), (fill_rx2, ry2), (fill_rx1, ry1)]
+
+
+def draw_lane_area(img, left_boundary, right_boundary):
+    if left_boundary is None or right_boundary is None:
+        return
+
+    polygon = np.array([inset_lane_fill(left_boundary, right_boundary)], dtype=np.int32)
+
+    overlay = img.copy()
+    cv2.fillPoly(overlay, polygon, (80, 190, 55))
+    cv2.addWeighted(overlay, 0.35, img, 0.65, 0, img)
+
+
+def draw_translucent_panel(img, top_left, bottom_right, alpha=0.78):
+    overlay = img.copy()
+    cv2.rectangle(overlay, top_left, bottom_right, (0, 0, 0), -1)
+    cv2.addWeighted(overlay, alpha, img, 1 - alpha, 0, img)
+
+
+def draw_legend(img):
+    draw_translucent_panel(img, (8, 10), (260, 112))
+
+    cv2.line(img, (24, 32), (58, 32), (255, 0, 0), 3)
+    cv2.putText(img, "Left Lane Boundary", (74, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 1, cv2.LINE_AA)
+
+    cv2.line(img, (24, 64), (58, 64), (0, 255, 0), 3)
+    cv2.putText(img, "Right Lane Boundary", (74, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 1, cv2.LINE_AA)
+
+    cv2.rectangle(img, (24, 84), (58, 102), (80, 190, 55), -1)
+    cv2.putText(img, "Detected Lane Area", (74, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 1, cv2.LINE_AA)
+
+
+def estimate_dashboard_metrics(img, left_boundary, right_boundary):
+    if left_boundary is None or right_boundary is None:
+        return "N/A", "N/A", "Searching"
+
+    lane_center = (left_boundary[0] + right_boundary[0]) / 2
+    vehicle_center = img.shape[1] / 2
+    lane_width_px = max(1, right_boundary[0] - left_boundary[0])
+    offset_m = (vehicle_center - lane_center) / lane_width_px * 3.7
+
+    left_angle = np.degrees(np.arctan2(left_boundary[1] - left_boundary[3], left_boundary[0] - left_boundary[2]))
+    right_angle = np.degrees(np.arctan2(right_boundary[1] - right_boundary[3], right_boundary[0] - right_boundary[2]))
+    curvature_km = max(0.25, min(9.99, 8.0 / (abs(left_angle - right_angle) + 1.0)))
+
+    if abs(offset_m) < 0.25:
+        status = "Lane Centered"
+    elif offset_m > 0:
+        status = "Shift Right"
+    else:
+        status = "Shift Left"
+
+    return f"{curvature_km:.2f} km", f"{offset_m:+.2f} m", status
+
+
+def draw_dashboard(img, left_boundary, right_boundary):
+    h, w = img.shape[:2]
+    x1 = max(0, w - 210)
+    y1 = 10
+    x2 = w - 8
+    y2 = 214
+    draw_translucent_panel(img, (x1, y1), (x2, y2))
+
+    curvature, offset, status = estimate_dashboard_metrics(img, left_boundary, right_boundary)
+
+    cv2.putText(img, "DASHBOARD", (x1 + 28, y1 + 34), cv2.FONT_HERSHEY_SIMPLEX, 0.76, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.line(img, (x1 + 16, y1 + 52), (x2 - 16, y1 + 52), (230, 230, 230), 1)
+
+    yellow = (0, 230, 255)
+    green = (40, 255, 40)
+    white = (255, 255, 255)
+
+    cv2.putText(img, "Curvature", (x1 + 28, y1 + 84), cv2.FONT_HERSHEY_SIMPLEX, 0.52, yellow, 1, cv2.LINE_AA)
+    cv2.putText(img, curvature, (x1 + 28, y1 + 108), cv2.FONT_HERSHEY_SIMPLEX, 0.52, white, 1, cv2.LINE_AA)
+    cv2.putText(img, "Vehicle Offset", (x1 + 28, y1 + 142), cv2.FONT_HERSHEY_SIMPLEX, 0.52, yellow, 1, cv2.LINE_AA)
+    cv2.putText(img, offset, (x1 + 28, y1 + 166), cv2.FONT_HERSHEY_SIMPLEX, 0.52, white, 1, cv2.LINE_AA)
+    cv2.putText(img, "Status", (x1 + 28, y1 + 198), cv2.FONT_HERSHEY_SIMPLEX, 0.52, yellow, 1, cv2.LINE_AA)
+    cv2.putText(img, status, (x1 + 88, y1 + 198), cv2.FONT_HERSHEY_SIMPLEX, 0.52, green, 1, cv2.LINE_AA)
+
+
+def compose_output_frame(main_view):
+    thumbnail_history.append(main_view.copy())
+
+    h, w = main_view.shape[:2]
+    output = np.zeros((h + THUMBNAIL_STRIP_HEIGHT, w, 3), dtype=np.uint8)
+    output[:h] = main_view
+
+    thumb_width = w // THUMBNAIL_COUNT
+    for index in range(THUMBNAIL_COUNT):
+        if index < len(thumbnail_history):
+            thumb = thumbnail_history[index]
+        else:
+            thumb = main_view
+
+        thumb = cv2.resize(thumb, (thumb_width, THUMBNAIL_STRIP_HEIGHT))
+        x1 = index * thumb_width
+        x2 = w if index == THUMBNAIL_COUNT - 1 else x1 + thumb_width
+        output[h:h + THUMBNAIL_STRIP_HEIGHT, x1:x2] = cv2.resize(thumb, (x2 - x1, THUMBNAIL_STRIP_HEIGHT))
+        cv2.rectangle(output, (x1, h), (x2 - 1, h + THUMBNAIL_STRIP_HEIGHT - 1), (0, 0, 0), 2)
+
+    cv2.line(output, (0, h), (w, h), (0, 0, 0), 3)
+    return output
 
 
 def process_frame(frame):
     image = cv2.resize(frame, (800, 500))
-
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.Canny(blur, 30, 120)
-    roi = region_of_interest(edges)
+    edges = cv2.Canny(blur, 50, 150)
+    white_edges = white_edge_mask(image, edges)
+    roi = region_of_interest(white_edges)
 
     lines = cv2.HoughLinesP(
         roi,
-        1,
+        2,
         np.pi / 180,
-        threshold=15,
-        minLineLength=20,
-        maxLineGap=50,
+        50,
+        minLineLength=50,
+        maxLineGap=100,
     )
 
-    # classify raw Hough lines into left / right groups
-    left_lines, right_lines = classify_lane_lines(image, lines)
+    _, width = roi.shape
+    left_lines, right_lines = filter_boundary_lines(lines, width)
 
-    # sample dense points from the raw segments and fit 2nd-order polynomials
-    left_sample_points = sample_points_from_lines(left_lines)
-    right_sample_points = sample_points_from_lines(right_lines)
+    lane_image = image.copy()
+    left_boundary = average_boundary_line(left_lines, image.shape[0], white_edges)
+    right_boundary = average_boundary_line(right_lines, image.shape[0], white_edges)
+    left_boundary = constrain_boundary_to_outer_band(left_boundary, image.shape[1], "left")
+    right_boundary = constrain_boundary_to_outer_band(right_boundary, image.shape[1], "right")
+    left_boundary, right_boundary = smooth_boundary_pair(left_boundary, right_boundary)
+    left_boundary, right_boundary = adjust_boundaries_for_display(left_boundary, right_boundary, image.shape[1])
 
-    # Fit raw polynomials from current frame
-    left_curve_raw = fit_lane_curve(left_sample_points)
-    right_curve_raw = fit_lane_curve(right_sample_points)
+    draw_lane_area(lane_image, left_boundary, right_boundary)
+    draw_boundary(lane_image, left_boundary, (255, 0, 0))
+    draw_boundary(lane_image, right_boundary, (0, 255, 0))
+    draw_legend(lane_image)
+    draw_dashboard(lane_image, left_boundary, right_boundary)
 
-    # Update temporal buffers with raw detections when available
-    if left_curve_raw is not None:
-        left_curve_buffer.append(np.array(left_curve_raw, dtype=np.float32))
-    if right_curve_raw is not None:
-        right_curve_buffer.append(np.array(right_curve_raw, dtype=np.float32))
-
-    # Compute smoothed coefficients (moving average) — handle missing detections gracefully
-    left_curve = None
-    right_curve = None
-    if len(left_curve_buffer) > 0:
-        left_curve = np.mean(np.vstack(list(left_curve_buffer)), axis=0)
-    if len(right_curve_buffer) > 0:
-        right_curve = np.mean(np.vstack(list(right_curve_buffer)), axis=0)
-
-    # Generate curve points from smoothed coefficients
-    left_curve_points = generate_curve_points(image, left_curve)
-    right_curve_points = generate_curve_points(image, right_curve)
-
-    # If both curves exist, ensure they do not cross. If they cross, trim
-    # the top portion up to the first crossing so the left x < right x holds.
-    if left_curve_points is not None and right_curve_points is not None:
-        # Both lists are ordered top->bottom
-        min_len = min(len(left_curve_points), len(right_curve_points))
-        crossed_index = None
-        for i in range(min_len):
-            lx, ly = left_curve_points[i]
-            rx, ry = right_curve_points[i]
-            if lx >= rx:
-                crossed_index = i
-                break
-
-        if crossed_index is not None:
-            # Trim everything up to and including the crossing index
-            new_left = left_curve_points[crossed_index + 1 :]
-            new_right = right_curve_points[crossed_index + 1 :]
-
-            # If trimming removed too many points, discard curves to avoid bad geometry
-            if len(new_left) >= 2 and len(new_right) >= 2:
-                left_curve_points = new_left
-                right_curve_points = new_right
-            else:
-                left_curve_points = None
-                right_curve_points = None
-
-    # Derive boundary anchor points (bottom, top) from curves when available
-    left_points = None
-    right_points = None
-    if left_curve_points is not None and len(left_curve_points) >= 2:
-        left_points = (left_curve_points[-1], left_curve_points[0])
-    if right_curve_points is not None and len(right_curve_points) >= 2:
-        right_points = (right_curve_points[-1], right_curve_points[0])
-
-    line_image = np.zeros_like(image)
-    debug = np.zeros_like(image)
-
-    if lines is not None:
-        for line in lines:
-            x1, y1, x2, y2 = line[0]
-            cv2.line(debug, (x1, y1), (x2, y2), (0, 255, 255), 2)
-
-    # Draw smooth polynomial boundaries when available
-    if left_curve_points is not None:
-        cv2.polylines(line_image, [np.array(left_curve_points, dtype=np.int32)], False, (255, 0, 0), 6)
-
-    if right_curve_points is not None:
-        cv2.polylines(line_image, [np.array(right_curve_points, dtype=np.int32)], False, (0, 255, 0), 6)
-
-    lane_overlay, _ = fill_lane_area(
-        image,
-        left_points,
-        right_points,
-        left_curve_points=left_curve_points,
-        right_curve_points=right_curve_points,
-    )
-    lane_image = cv2.addWeighted(lane_overlay, 0.8, line_image, 1, 1)
-
-    metrics = calculate_lane_metrics(image, left_points, right_points)
-    curvature = estimate_lane_curvature(image, left_curve, right_curve, left_curve_points, right_curve_points)
-    if metrics is not None:
-        lane_image = draw_lane_guidance(lane_image, left_points, right_points, metrics, curvature)
-
-    return image, edges, roi, debug, lane_image
+    return compose_output_frame(lane_image)
 
 
 def main():
@@ -502,30 +354,19 @@ def main():
     if not capture.isOpened():
         raise SystemExit(f"Error: Video not found or cannot be opened: {VIDEO_PATH}")
 
+    Path(OUTPUT_VIDEO_PATH).parent.mkdir(parents=True, exist_ok=True)
+
     writer = None
-    frame_count = 0
-    latest_views = None
     fps = capture.get(cv2.CAP_PROP_FPS)
     if fps <= 0:
         fps = 30.0
-    display_delay = get_display_delay_ms(fps)
 
     while True:
         ret, frame = capture.read()
         if not ret:
             break
 
-        frame_count += 1
-        should_process = (
-            latest_views is None
-            or PROCESS_EVERY_NTH_FRAME <= 1
-            or frame_count % PROCESS_EVERY_NTH_FRAME == 0
-        )
-
-        if should_process:
-            latest_views = process_frame(frame)
-
-        image, edges, roi, debug, lane_image = latest_views
+        lane_image = process_frame(frame)
 
         if writer is None:
             frame_height, frame_width = lane_image.shape[:2]
@@ -534,19 +375,9 @@ def main():
 
         writer.write(lane_image)
 
-        cv2.imshow("Original", image)
-        cv2.imshow("Edges", edges)
-        cv2.imshow("ROI", roi)
-        cv2.imshow("Raw Lines", debug)
-        cv2.imshow("Lane Detection", lane_image)
-
-        if cv2.waitKey(display_delay) & 0xFF == 27:
-            break
-
     capture.release()
     if writer is not None:
         writer.release()
-    cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":

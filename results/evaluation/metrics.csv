@@ -1,0 +1,3 @@
+source,type,samples,source_fps,processing_fps,detection_rate,valid_count,invalid_count,avg_lane_width_m,std_lane_width_m,avg_curvature_m,std_curvature_m,curvature_cv
+data\road.jpg,image,1,,65.2394,100.0000,1,0,3.7000,0.0000,1036.8743,0.0000,0.0000
+data\road.mp4,video,248,29.9710,81.0193,99.5968,247,1,3.7000,0.0000,539.9091,6661.7215,12.3386
