@@ -1,10 +1,23 @@
-# Autonomous Road Understanding Through Lane Detection and Curvature Estimation
+# Autonomous Road Understanding System Using Image Processing Techniques
 
 ## Project Overview
 
 This project implements a robust lane detection and road curvature estimation pipeline using classical computer vision techniques. It is designed to detect and track left and right lane boundaries, smooth temporal lane predictions, compute vehicle offset, and estimate road curvature across multiple driving scenarios.
 
 The system supports evaluation across scenario-specific datasets such as highway, curved roads, night driving, and rainy weather, while generating annotated outputs and CSV metrics for analysis.
+
+## Features
+
+* Lane Detection
+* Road Curvature Estimation
+* Vehicle Detection
+* Pedestrian Detection
+* Traffic Sign Detection
+* Distance Estimation
+* Collision Warning Generation
+* Lane Departure Warning
+* Road Scene Dashboard
+
 
 ## Tech Stack
 
