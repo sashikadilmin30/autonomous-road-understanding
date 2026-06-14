@@ -25,6 +25,9 @@ The system supports evaluation across scenario-specific datasets such as highway
 - OpenCV for image/video processing and visualization
 - NumPy for numeric operations and polynomial fitting
 - CSV output for evaluation metrics
+- Image Processing
+- Computer Vision
+- Video Processing
 
 ## Pipeline
 
@@ -99,3 +102,7 @@ python evaluate.py --data data --output results/evaluation/metrics.csv
 - Add ground truth comparison and per-frame accuracy metrics.
 - Extend to multi-lane and junction detection.
 - Add automated visualization dashboards or plots for scenario comparisons.
+
+## Sample Output
+
+![System Output](images/dashboard_output.png)
